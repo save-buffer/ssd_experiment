@@ -16,6 +16,24 @@ constexpr size_t NUM_PARTITIONS = 16;
 const uint32_t NUM_THREADS = std::thread::hardware_concurrency();
 
 using Batch = std::pair<uint64_t *, uint64_t *>;
+struct LazyBatch
+{
+    uint64_t *key()
+    {
+        if(!batch.first)
+            batch.first = (uint64_t *)malloc(BATCH_SIZE * sizeof(uint64_t));
+        return batch.first;
+    }
+
+    uint64_t *pay()
+    {
+        if(!batch.second)
+            batch.second = (uint64_t *)malloc(BATCH_SIZE * sizeof(uint64_t));
+        return batch.second;
+    }
+    Batch batch = { nullptr, nullptr };
+    uint64_t length = 0;
+};
 
 enum class State
 {
@@ -28,8 +46,8 @@ enum class State
 struct ThreadLocalData
 {
     std::default_random_engine rng;
-    bool build_done = false;
-    bool probe_done = false;
+    LazyBatch partitions[NUM_PARTITIONS];
+    uint64_t *hashes;
 };
 
 struct Partition
@@ -62,30 +80,92 @@ Batch GenerateBatch(ThreadLocalData &tld)
     return { key, pay };
 }
 
-void OnBuildSide(Batch batch)
+void EnqueueBatch(Batch batch, std::vector<Batch> &accum)
 {
-retry:
+    accum.push_back(batch);
+}
+
+void EnqueueBatch_Build(Batch batch)
+{
+    std::lock_guard guard(build_mutex);
+    EnqueueBatch(batch, build_accum);
+}
+
+void PartitionBuild(ThreadLocalData &tld)
+{
+    for(;;)
+    {
+        Batch batch;
+        {
+            std::lock_guard guard(build_mutex);
+            if(build_accum.empty())
+                return;
+            batch = build_accum.back();
+            build_accum.pop_back();
+        }
+        std::transform(batch.first, batch.first + BATCH_SIZE, tld.hashes, std::hash);
+        std::sort(batch.first, batch.first + BATCH_SIZE, [&](const uint64_t &a, const uint64_t &b)
+        {
+            int a_idx = &a - batch.first;
+            int b_idx = &b - batch.first;
+            uint64_t pid_a = tld.hashes[a_idx] % NUM_PARTITIONS;
+            uint64_t pid_b = tld.hashes[b_idx] % NUM_PARTITIONS;
+            return pid_a < pid_b;
+        });
+        std::sort(batch.second, batch.second + BATCH_SIZE, [&](const uint64_t &a, const uint64_t &b)
+        {
+            int a_idx = &a - batch.second;
+            int b_idx = &b - batch.second;
+            uint64_t pid_a = tld.hashes[a_idx] % NUM_PARTITIONS;
+            uint64_t pid_b = tld.hashes[b_idx] % NUM_PARTITIONS;
+            return pid_a < pid_b;
+        });
+        std::sort(tld.hashes, tld.hashes + BATCH_SIZE, [&](const uint64_t &a, const uint64_t &b)
+        {
+            return (a % NUM_PARTITIONS) < (b % NUM_PARTITIONS);
+        });
+        int partition_starts[NUM_PARTITIONS];
+        partition_starts[0] = 0;
+        for(int i = 1; i < NUM_PARTITIONS; i++)
+        {
+            auto p = std::find_if(tld.hashes, tld.hashes + BATCH_SIZE,
+                                  [&](const uint64_t &hash)
+                                  {
+                                      return (hash % NUM_PARTITIONS) == i;
+                                  });
+            if(p == tld.hashes + BATCH_SIZE)
+                partition_starts[i] = partition_starts[i - 1];
+            else
+                partition_starts[i] = p - tld.hashes;
+        }
+    }
+}
+
+void OnBuildSide(Batch batch, ThreadLocalData &tld)
+{
     State state_local = state.load();
     switch(state_local)
     {
     case State::Accepting:
     {
+        EnqueueBatch_Build(batch);
         rusage usage;
         getrusage(RUSAGE_SELF, &usage);
         int64_t memory_used = usage.ru_maxrss;
-        if(memory_used >= MAX_MEMORY)
+        if(memory_used < MAX_MEMORY)
         {
-            State expected = State::Accepting;
-            state.compare_exchange_strong(expected, State::PartitioningBuild);
-            goto retry;
+            return;
         }
-        
+        State expected = State::Accepting;
+        state.compare_exchange_strong(expected, State::PartitioningBuild);
     }
-    break;
+    // Fall through
     case State::PartitioningBuild:
-        break;
+        PartitionBuild(tld);
+        // Fall through
     case State::PartitioningProbe:
-        break;
+        PartitionProbe();
+        // Fall through
     case State::Spilling:
         break;
     }
@@ -95,7 +175,10 @@ int main()
 {
     thread_local_data.resize(NUM_THREADS);
     for(uint32_t i = 0; i < NUM_THREADS; i++)
+    {
         thread_local_data[i].rng.seed(i);
+        thread_local_data[i].hashes = (uint64_t *)malloc(BATCH_SIZE * sizeof(uint64_t));
+    }
 
     #pragma omp parallel for
     for(size_t ibatch = 0; ibatch < NUM_TOTAL_BATCHES; ibatch++)
@@ -106,9 +189,9 @@ int main()
         ThreadLocalData &tld = thread_local_data[tid];
         Batch batch = GenerateBatch(tld);
         if(is_probe)
-            OnProbeSide(batch);
+            OnProbeSide(batch, tld);
         else
-            OnBuildSide(batch);
+            OnBuildSide(batch, tld);
     }
     return 0;
 }

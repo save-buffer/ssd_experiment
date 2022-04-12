@@ -1,10 +1,13 @@
 #include <omp.h>
+#include <algorithm>
 #include <atomic>
+#include <cstring>
 #include <mutex>
 #include <random>
 #include <thread>
 #include <unordered_map>
 #include <utility>
+#include <functional>
 #include <sys/resource.h>
 
 constexpr size_t MAX_MEMORY = 4ull * 1024ull * 1024ull * 1024ull; // 4gb
@@ -16,7 +19,7 @@ constexpr size_t NUM_PARTITIONS = 16;
 const uint32_t NUM_THREADS = std::thread::hardware_concurrency();
 
 using Batch = std::pair<uint64_t *, uint64_t *>;
-struct LazyBatch
+struct BatchBuilder
 {
     uint64_t *key()
     {
@@ -31,6 +34,12 @@ struct LazyBatch
             batch.second = (uint64_t *)malloc(BATCH_SIZE * sizeof(uint64_t));
         return batch.second;
     }
+
+    bool IsFull()
+    {
+        return length == BATCH_SIZE;
+    }
+
     Batch batch = { nullptr, nullptr };
     uint64_t length = 0;
 };
@@ -46,14 +55,16 @@ enum class State
 struct ThreadLocalData
 {
     std::default_random_engine rng;
-    LazyBatch partitions[NUM_PARTITIONS];
+    BatchBuilder partitions[NUM_PARTITIONS];
     uint64_t *hashes;
 };
 
 struct Partition
 {
     std::mutex lock;
-    std::vector<Batch> accum;
+    std::vector<Batch> build;
+    std::vector<Batch> probe;
+    int64_t num_rows = 0;
 };
 
 std::vector<ThreadLocalData> thread_local_data;
@@ -91,6 +102,79 @@ void EnqueueBatch_Build(Batch batch)
     EnqueueBatch(batch, build_accum);
 }
 
+void EnqueueBatch_Probe(Batch batch)
+{
+    std::lock_guard guard(probe_mutex);
+    EnqueueBatch(batch, probe_accum);
+}
+
+void FlushPartition(int pid, BatchBuilder &bb, bool is_build)
+{
+    std::lock_guard guard(partitions[pid].lock);
+    if(is_build)
+        partitions[pid].build.push_back(bb.batch);
+    else
+        partitions[pid].probe.push_back(bb.batch);
+    bb.length = 0;
+    bb.batch = { nullptr, nullptr };
+}
+
+void AppendBatchToPartitions(Batch batch, ThreadLocalData &tld, const int *partition_starts, bool is_build)
+{
+    for(int p = 0; p < NUM_PARTITIONS; p++)
+    {
+        BatchBuilder &bb = tld.partitions[p];
+        uint64_t num_to_copy = partition_starts[p + 1] - partition_starts[p];
+        int copy_into_this_batch = std::min(num_to_copy, BATCH_SIZE - bb.length);
+        std::memcpy(bb.key() + bb.length, batch.first + partition_starts[p], copy_into_this_batch);
+        std::memcpy(bb.pay() + bb.length, batch.second + partition_starts[p], copy_into_this_batch);
+        bb.length += num_to_copy;
+        if(bb.IsFull())
+        {
+            FlushPartition(p, bb, is_build);
+            num_to_copy -= copy_into_this_batch;
+            std::memcpy(bb.key(), batch.first + partition_starts[p] + copy_into_this_batch, num_to_copy);
+            std::memcpy(bb.pay(), batch.second + partition_starts[p] + copy_into_this_batch, num_to_copy);
+            bb.length = num_to_copy;
+        }
+    }
+}
+
+void PartitionSingleBatch(Batch batch, ThreadLocalData &tld, bool is_build)
+{
+    std::transform(batch.first, batch.first + BATCH_SIZE, tld.hashes, std::hash<uint64_t>{});
+    std::sort(batch.first, batch.first + BATCH_SIZE, [&](const uint64_t &a, const uint64_t &b)
+    {
+        int a_idx = &a - batch.first;
+        int b_idx = &b - batch.first;
+        uint64_t pid_a = tld.hashes[a_idx] % NUM_PARTITIONS;
+        uint64_t pid_b = tld.hashes[b_idx] % NUM_PARTITIONS;
+        return pid_a < pid_b;
+    });
+    std::sort(batch.second, batch.second + BATCH_SIZE, [&](const uint64_t &a, const uint64_t &b)
+    {
+        int a_idx = &a - batch.second;
+        int b_idx = &b - batch.second;
+        uint64_t pid_a = tld.hashes[a_idx] % NUM_PARTITIONS;
+        uint64_t pid_b = tld.hashes[b_idx] % NUM_PARTITIONS;
+        return pid_a < pid_b;
+    });
+    std::sort(tld.hashes, tld.hashes + BATCH_SIZE, [&](const uint64_t &a, const uint64_t &b)
+    {
+        return (a % NUM_PARTITIONS) < (b % NUM_PARTITIONS);
+    });
+    int partition_starts[NUM_PARTITIONS + 1];
+    int irow = 0;
+    for(int i = 1; i < NUM_PARTITIONS; i++)
+    {
+        while((tld.hashes[irow] % NUM_PARTITIONS) < i)
+            irow++;
+        partition_starts[i] = irow;
+    }
+    partition_starts[NUM_PARTITIONS] = BATCH_SIZE;
+    AppendBatchToPartitions(batch, tld, partition_starts, is_build);
+}
+
 void PartitionBuild(ThreadLocalData &tld)
 {
     for(;;)
@@ -103,42 +187,12 @@ void PartitionBuild(ThreadLocalData &tld)
             batch = build_accum.back();
             build_accum.pop_back();
         }
-        std::transform(batch.first, batch.first + BATCH_SIZE, tld.hashes, std::hash);
-        std::sort(batch.first, batch.first + BATCH_SIZE, [&](const uint64_t &a, const uint64_t &b)
-        {
-            int a_idx = &a - batch.first;
-            int b_idx = &b - batch.first;
-            uint64_t pid_a = tld.hashes[a_idx] % NUM_PARTITIONS;
-            uint64_t pid_b = tld.hashes[b_idx] % NUM_PARTITIONS;
-            return pid_a < pid_b;
-        });
-        std::sort(batch.second, batch.second + BATCH_SIZE, [&](const uint64_t &a, const uint64_t &b)
-        {
-            int a_idx = &a - batch.second;
-            int b_idx = &b - batch.second;
-            uint64_t pid_a = tld.hashes[a_idx] % NUM_PARTITIONS;
-            uint64_t pid_b = tld.hashes[b_idx] % NUM_PARTITIONS;
-            return pid_a < pid_b;
-        });
-        std::sort(tld.hashes, tld.hashes + BATCH_SIZE, [&](const uint64_t &a, const uint64_t &b)
-        {
-            return (a % NUM_PARTITIONS) < (b % NUM_PARTITIONS);
-        });
-        int partition_starts[NUM_PARTITIONS];
-        partition_starts[0] = 0;
-        for(int i = 1; i < NUM_PARTITIONS; i++)
-        {
-            auto p = std::find_if(tld.hashes, tld.hashes + BATCH_SIZE,
-                                  [&](const uint64_t &hash)
-                                  {
-                                      return (hash % NUM_PARTITIONS) == i;
-                                  });
-            if(p == tld.hashes + BATCH_SIZE)
-                partition_starts[i] = partition_starts[i - 1];
-            else
-                partition_starts[i] = p - tld.hashes;
-        }
+        PartitionSingleBatch(batch, tld, /*is_build*/ true);
     }
+}
+
+void PartitionProbe(ThreadLocalData &tld)
+{
 }
 
 void OnBuildSide(Batch batch, ThreadLocalData &tld)
@@ -164,11 +218,15 @@ void OnBuildSide(Batch batch, ThreadLocalData &tld)
         PartitionBuild(tld);
         // Fall through
     case State::PartitioningProbe:
-        PartitionProbe();
+        PartitionProbe(tld);
         // Fall through
     case State::Spilling:
         break;
     }
+}
+
+void OnProbeSide(Batch batch, ThreadLocalData &tld)
+{
 }
 
 int main()
@@ -188,7 +246,7 @@ int main()
         int tid = omp_get_thread_num();
         ThreadLocalData &tld = thread_local_data[tid];
         Batch batch = GenerateBatch(tld);
-        if(is_probe)
+        if(is_probe(tld.rng))
             OnProbeSide(batch, tld);
         else
             OnBuildSide(batch, tld);
